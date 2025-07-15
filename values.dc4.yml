@@ -1,0 +1,7 @@
+# See the `web-service` chart for more info:
+# http://docs.ferris-wheel-charts.paascloud.oneadp.com/web-service/
+
+container:
+  env:
+    WILY_ENABLED: "false"
+
