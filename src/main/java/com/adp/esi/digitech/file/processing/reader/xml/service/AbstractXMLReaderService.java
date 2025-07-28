@@ -1,0 +1,423 @@
+package com.adp.esi.digitech.file.processing.reader.xml.service;
+
+import javax.xml.stream.XMLInputFactory;
+import javax.xml.stream.XMLStreamException;
+import javax.xml.stream.XMLStreamReader;
+
+import java.io.InputStream;
+import java.io.Reader;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import com.adp.esi.digitech.file.processing.ds.config.model.FileMetaData;
+import com.adp.esi.digitech.file.processing.ds.model.ColumnRelation;
+import com.adp.esi.digitech.file.processing.exception.ReaderException;
+import com.adp.esi.digitech.file.processing.reader.service.AbstractReaderService;
+import com.adp.esi.digitech.file.processing.util.ValidationUtil;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
+
+/**
+ * Abstract base class for XML reader services, providing shared logic for
+ * parsing XML files and mapping data to DataMap objects using templates.
+ * Enhanced to support sourceKey-based grouping and primary identifier handling.
+ * 
+ * @author rhidau
+ */
+@Slf4j
+public abstract class AbstractXMLReaderService<T, V> extends AbstractReaderService<T, V> {
+
+	@Autowired
+	protected ObjectMapper objectMapper;
+
+	protected Map<String, Map<String, ColumnRelation>> sourceKeyColumnRelationMap = new HashMap<>();
+
+	protected Map<String, String> templateUuidMap = new HashMap<>();
+
+	protected Map<String, String> sourceKeyPrimaryIdMap = new HashMap<>();
+
+	protected String rootElementName;
+
+	protected String primaryIdentifierField;
+
+	@Autowired
+	ObjectProvider<XMLPayloadReductionService> payloadReductionServiceObjectProvider;
+
+	/**
+	 * Initializes the mapping of XML paths to UUIDs based on the xmlTemplate in
+	 * FileMetaData and groups column relations by sourceKey.
+	 */
+	protected void initializeTemplateMapping(FileMetaData fileMetaData, List<ColumnRelation> columnRelations) {
+		try {
+			String xmlTemplateStr = fileMetaData.getTemplate();
+			if (!ValidationUtil.isHavingValue(xmlTemplateStr)) {
+				log.error(
+						"AbstractXMLReaderService -> initializeTemplateMapping() template is empty or null for sourceKey = {}, uniqueId = {}",
+						fileMetaData.getSourceKey(), requestContext.getUniqueId());
+				var readerException = new ReaderException("xmlTemplate cannot be empty or null in FileMetaData");
+				readerException.setRequestContext(requestContext);
+				throw readerException;
+			}
+
+			JsonNode template;
+			try {
+				template = objectMapper.readTree(xmlTemplateStr);
+			} catch (Exception e) {
+				log.error(
+						"AbstractXMLReaderService -> initializeTemplateMapping() Failed to parse xmlTemplate JSON for sourceKey = {}, uniqueId = {}, message = {}",
+						fileMetaData.getSourceKey(), requestContext.getUniqueId(), e.getMessage());
+				var readerException = new ReaderException("Invalid xmlTemplate JSON format: " + e.getMessage(), e);
+				readerException.setRequestContext(requestContext);
+				throw readerException;
+			}
+
+			templateUuidMap.clear();
+			sourceKeyColumnRelationMap.clear();
+			sourceKeyPrimaryIdMap.clear();
+
+			if (template.has("primaryIdentifier")) {
+				primaryIdentifierField = template.get("primaryIdentifier").asText();
+				log.info("AbstractXMLReaderService -> initializeTemplateMapping() Found primary identifier: {}",
+						primaryIdentifierField);
+			}
+
+			sourceKeyColumnRelationMap = columnRelations.stream().collect(Collectors.groupingBy(
+					ColumnRelation::getSourceKey, Collectors.toMap(ColumnRelation::getUuid, Function.identity())));
+
+			log.info(
+					"AbstractXMLReaderService -> initializeTemplateMapping() Grouped column relations into {} sourceKeys: {}",
+					sourceKeyColumnRelationMap.size(), sourceKeyColumnRelationMap.keySet());
+
+			for (Map.Entry<String, Map<String, ColumnRelation>> entry : sourceKeyColumnRelationMap.entrySet()) {
+				String sourceKey = entry.getKey();
+				Map<String, ColumnRelation> relations = entry.getValue();
+
+				if (ValidationUtil.isHavingValue(primaryIdentifierField)) {
+					relations.values().stream().filter(rel -> primaryIdentifierField.equals(rel.getColumnName()))
+							.findFirst().ifPresent(rel -> {
+								sourceKeyPrimaryIdMap.put(sourceKey, rel.getUuid());
+								log.debug(
+										"AbstractXMLReaderService -> initializeTemplateMapping() Mapped primary identifier {} to UUID {} for sourceKey {}",
+										primaryIdentifierField, rel.getUuid(), sourceKey);
+							});
+				}
+			}
+
+			JsonNode rootNode = null;
+
+			// Check for xmlTemplate wrapper
+			if (template.has("template")) {
+				rootNode = template.get("template");
+			} else {
+				rootNode = template;
+			}
+
+			if (rootNode == null || !rootNode.has("name")
+					|| !ValidationUtil.isHavingValue(rootNode.get("name").asText())) {
+				var readerException = new ReaderException(
+						"xmlTemplate does not define a valid root element with name field");
+				readerException.setRequestContext(requestContext);
+				throw readerException;
+			}
+
+			rootElementName = rootNode.get("name").asText();
+			log.info(
+					"AbstractXMLReaderService -> initializeTemplateMapping() Determined root element name: {}, sourceKey = {}, uniqueId = {}",
+					rootElementName, fileMetaData.getSourceKey(), requestContext.getUniqueId());
+
+			parseTemplateNode(rootNode, "");
+
+			log.info(
+					"AbstractXMLReaderService -> initializeTemplateMapping() Initialized template mapping with {} entries for sourceKey = {}, uniqueId = {}",
+					templateUuidMap.size(), fileMetaData.getSourceKey(), requestContext.getUniqueId());
+			log.debug("AbstractXMLReaderService -> initializeTemplateMapping() Template UUID mappings: {}",
+					templateUuidMap);
+
+		} catch (ReaderException re) {
+			throw re;
+		} catch (Exception e) {
+			log.error(
+					"AbstractXMLReaderService -> initializeTemplateMapping() Failed to initialize template mapping for sourceKey = {}, uniqueId = {}, message = {}",
+					fileMetaData.getSourceKey(), requestContext.getUniqueId(), e.getMessage());
+			var readerException = new ReaderException("Failed to initialize template mapping: " + e.getMessage(), e);
+			readerException.setRequestContext(requestContext);
+			throw readerException;
+		}
+	}
+
+	/**
+	 * Recursively parses the sophisticated xmlTemplate JSON to build a mapping of
+	 * XML paths to UUIDs. Handles template format generated by
+	 * XSDSchemaConfigurationService.convertXsdNodeToTemplateNode()
+	 * 
+	 * Template structure: { "id": "uuid", "name": "elementName", "attrs": [{"name":
+	 * "attrName", "value": "{{uuid}}"}], "value": "{{uuid}}", "child": [...] }
+	 */
+	private void parseTemplateNode(JsonNode node, String parentPath) {
+		if (!node.has("name") || !ValidationUtil.isHavingValue(node.get("name").asText())) {
+			return;
+		}
+
+		String nodeName = node.get("name").asText();
+		String currentPath = ValidationUtil.isHavingValue(parentPath) ? parentPath + "." + nodeName : nodeName;
+
+		if (node.has("value") && ValidationUtil.isHavingValue(node.get("value").asText())) {
+			String value = node.get("value").asText();
+			if (isUuidPlaceholder(value)) {
+				String uuid = extractUuid(value);
+				templateUuidMap.put(currentPath, uuid);
+				log.debug("AbstractXMLReaderService -> parseTemplateNode() Mapped element path {} to UUID {}",
+						currentPath, uuid);
+			}
+		}
+
+		if (node.has("attrs") && node.get("attrs").isArray()) {
+			JsonNode attrsArray = node.get("attrs");
+			for (JsonNode attr : attrsArray) {
+				if (attr.has("name") && attr.has("value") && ValidationUtil.isHavingValue(attr.get("name").asText())
+						&& ValidationUtil.isHavingValue(attr.get("value").asText())) {
+
+					String attrName = attr.get("name").asText();
+					String attrValue = attr.get("value").asText();
+
+					if (isUuidPlaceholder(attrValue)) {
+						String uuid = extractUuid(attrValue);
+						String attrPath = currentPath + "@" + attrName;
+						templateUuidMap.put(attrPath, uuid);
+						log.debug("AbstractXMLReaderService -> parseTemplateNode() Mapped attribute path {} to UUID {}",
+								attrPath, uuid);
+					}
+				}
+			}
+		}
+
+		if (node.has("child") && node.get("child").isArray()) {
+			JsonNode childArray = node.get("child");
+			for (JsonNode child : childArray) {
+				parseTemplateNode(child, currentPath);
+			}
+		}
+	}
+
+	/**
+	 * Extracts data from XML elements and maps them to UUIDs using the template
+	 * mapping. Enhanced to handle primary identifier propagation across sourceKeys.
+	 * Returns Map<sourceKey, Map<UUID, String>> following the same pattern as other
+	 * readers.
+	 */
+	protected Map<String, Map<UUID, String>> extractDataFromXMLGrouped(XMLStreamReader xmlReader,
+			String rootElementName) throws XMLStreamException {
+
+		Map<String, Map<UUID, String>> groupedDataMap = new HashMap<>();
+		String globalPrimaryIdValue = null;
+
+		Map<UUID, String> extractedData = extractDataFromXML(xmlReader, rootElementName);
+
+		if (ValidationUtil.isHavingValue(primaryIdentifierField)) {
+			for (Map.Entry<String, String> entry : sourceKeyPrimaryIdMap.entrySet()) {
+				String primaryIdUuid = entry.getValue();
+				String primaryIdValue = extractedData.get(UUID.fromString(primaryIdUuid));
+				if (ValidationUtil.isHavingValue(primaryIdValue)) {
+					globalPrimaryIdValue = primaryIdValue;
+					log.debug(
+							"AbstractXMLReaderService -> extractDataFromXMLGrouped() Extracted global primary identifier value: {}",
+							globalPrimaryIdValue);
+					break;
+				}
+			}
+		}
+
+		for (String sourceKey : sourceKeyColumnRelationMap.keySet()) {
+			Map<UUID, String> dataMap = new HashMap<>();
+
+			Map<String, ColumnRelation> relations = sourceKeyColumnRelationMap.get(sourceKey);
+			for (ColumnRelation relation : relations.values()) {
+				dataMap.put(UUID.fromString(relation.getUuid()), null);
+			}
+
+			if (ValidationUtil.isHavingValue(globalPrimaryIdValue) && sourceKeyPrimaryIdMap.containsKey(sourceKey)) {
+				String primaryIdUuid = sourceKeyPrimaryIdMap.get(sourceKey);
+				dataMap.put(UUID.fromString(primaryIdUuid), globalPrimaryIdValue);
+				log.debug(
+						"AbstractXMLReaderService -> extractDataFromXMLGrouped() Set primary identifier {} for sourceKey {}",
+						globalPrimaryIdValue, sourceKey);
+			}
+
+			groupedDataMap.put(sourceKey, dataMap);
+		}
+
+		for (Map.Entry<UUID, String> entry : extractedData.entrySet()) {
+			UUID uuid = entry.getKey();
+			String value = entry.getValue();
+
+			for (Map.Entry<String, Map<String, ColumnRelation>> sourceEntry : sourceKeyColumnRelationMap.entrySet()) {
+				String sourceKey = sourceEntry.getKey();
+				Map<String, ColumnRelation> relations = sourceEntry.getValue();
+
+				boolean uuidFound = relations.values().stream().anyMatch(rel -> uuid.toString().equals(rel.getUuid()));
+
+				if (uuidFound && ValidationUtil.isHavingValue(value)) {
+					groupedDataMap.get(sourceKey).put(uuid, value);
+					log.debug(
+							"AbstractXMLReaderService -> extractDataFromXMLGrouped() Mapped UUID {} = {} to sourceKey {}",
+							uuid, value, sourceKey);
+					break;
+				}
+			}
+		}
+
+		return groupedDataMap;
+	}
+
+	/**
+	 * Extracts data from XML elements and maps them to UUIDs using the template
+	 * mapping.
+	 */
+	protected Map<UUID, String> extractDataFromXML(XMLStreamReader xmlReader, String rootElementName)
+			throws XMLStreamException {
+		Map<UUID, String> dataMap = new HashMap<>();
+		int depth = 0;
+		String currentPath = rootElementName;
+
+		while (xmlReader.hasNext()) {
+			int event = xmlReader.next();
+
+			if (event == XMLStreamReader.START_ELEMENT) {
+				depth++;
+				String elementName = xmlReader.getLocalName();
+
+				if (depth == 1) {
+					currentPath = rootElementName + "." + elementName;
+				} else {
+					currentPath = currentPath + "." + elementName;
+				}
+
+				for (int i = 0; i < xmlReader.getAttributeCount(); i++) {
+					String attrName = xmlReader.getAttributeLocalName(i);
+					String attrValue = xmlReader.getAttributeValue(i);
+					String attrPath = currentPath + "@" + attrName;
+
+					String uuid = templateUuidMap.get(attrPath);
+					if (ValidationUtil.isHavingValue(uuid)) {
+						dataMap.put(UUID.fromString(uuid), attrValue);
+						log.debug(
+								"AbstractXMLReaderService -> extractDataFromXML() Mapped attribute {} = {} to UUID {}",
+								attrPath, attrValue, uuid);
+					}
+				}
+
+			} else if (event == XMLStreamReader.CHARACTERS || event == XMLStreamReader.CDATA) {
+				String textValue = xmlReader.getText().trim();
+				if (ValidationUtil.isHavingValue(textValue)) {
+					String uuid = templateUuidMap.get(currentPath);
+					if (ValidationUtil.isHavingValue(uuid)) {
+						dataMap.put(UUID.fromString(uuid), textValue);
+						log.debug(
+								"AbstractXMLReaderService -> extractDataFromXML() Mapped element text {} = {} to UUID {}",
+								currentPath, textValue, uuid);
+					}
+				}
+
+			} else if (event == XMLStreamReader.END_ELEMENT) {
+				String elementName = xmlReader.getLocalName();
+
+				if (rootElementName.equals(elementName) && depth == 0) {
+					break;
+				}
+
+				depth--;
+
+				if (currentPath.contains(".")) {
+					int lastDotIndex = currentPath.lastIndexOf(".");
+					currentPath = currentPath.substring(0, lastDotIndex);
+				}
+			}
+		}
+
+		return dataMap;
+	}
+
+	/**
+	 * Checks if a value is a UUID placeholder Format: {{uuid-value}}
+	 */
+	private boolean isUuidPlaceholder(String value) {
+		return ValidationUtil.isHavingValue(value) && value.startsWith("{{") && value.endsWith("}}");
+	}
+
+	/**
+	 * Extracts the UUID from a placeholder Converts {{uuid-value}} -> uuid-value
+	 */
+	private String extractUuid(String value) {
+		return value.substring(2, value.length() - 2);
+	}
+
+	/**
+	 * Creates an XMLStreamReader for the given input stream
+	 */
+	protected XMLStreamReader createStreamReader(InputStream inputStream) throws XMLStreamException {
+		XMLInputFactory factory = XMLInputFactory.newInstance();
+		// Configure factory for better performance and security
+		factory.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, false);
+		factory.setProperty(XMLInputFactory.IS_VALIDATING, false);
+		factory.setProperty(XMLInputFactory.SUPPORT_DTD, false);
+		return factory.createXMLStreamReader(inputStream);
+	}
+
+	/**
+	 * Creates an XMLStreamReader for the given reader (overloaded for large files)
+	 */
+	protected XMLStreamReader createStreamReader(Reader reader) throws XMLStreamException {
+		XMLInputFactory factory = XMLInputFactory.newInstance();
+		// Configure factory for better performance and security
+		factory.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, false);
+		factory.setProperty(XMLInputFactory.IS_VALIDATING, false);
+		factory.setProperty(XMLInputFactory.SUPPORT_DTD, false);
+		return factory.createXMLStreamReader(reader);
+	}
+
+	/**
+	 * Validates the FileMetaData for XML processing
+	 */
+	protected void validateFileMetaData(FileMetaData fileMetaData) {
+		if (fileMetaData == null) {
+			log.error("AbstractXMLReaderService -> validateFileMetaData() FileMetaData is null, uniqueId = {}",
+					requestContext.getUniqueId());
+			var readerException = new ReaderException("FileMetaData cannot be null");
+			readerException.setRequestContext(requestContext);
+			throw readerException;
+		}
+		if (!"XML".equalsIgnoreCase(fileMetaData.getType())) {
+			log.error(
+					"AbstractXMLReaderService -> validateFileMetaData() Invalid FileMetaData type for sourceKey = {}, uniqueId = {}, expected 'XML', got '{}'",
+					fileMetaData.getSourceKey(), requestContext.getUniqueId(), fileMetaData.getType());
+			var readerException = new ReaderException("FileMetaData type must be 'XML' for XML processing");
+			readerException.setRequestContext(requestContext);
+			throw readerException;
+		}
+		if (!ValidationUtil.isHavingValue(fileMetaData.getTemplate())) {
+			log.error(
+					"AbstractXMLReaderService -> validateFileMetaData() xmlTemplate is missing in FileMetaData for sourceKey = {}, uniqueId = {}",
+					fileMetaData.getSourceKey(), requestContext.getUniqueId());
+			var readerException = new ReaderException("template is required in FileMetaData for XML processing");
+			readerException.setRequestContext(requestContext);
+			throw readerException;
+		}
+		if (!ValidationUtil.isHavingValue(fileMetaData.getSourceKey())) {
+			log.error(
+					"AbstractXMLReaderService -> validateFileMetaData() sourceKey is missing in FileMetaData, uniqueId = {}",
+					requestContext.getUniqueId());
+			var readerException = new ReaderException("sourceKey is required in FileMetaData");
+			readerException.setRequestContext(requestContext);
+			throw readerException;
+		}
+	}
+}

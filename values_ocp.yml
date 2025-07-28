@@ -1,0 +1,67 @@
+# See the `web-service` chart for more info:
+# http://docs.ferris-wheel-charts.paascloud.oneadp.com/web-service/
+image:
+  repository: ${deploy_registry}/ibpm/${deploy_project_name}
+  tag: ${VERSION}
+readiness:
+ enabled: true
+ path: "/actuator/health/readiness"
+ initialDelaySeconds: 180
+ periodSeconds: 60
+ timeoutSeconds: 30
+ failureThreshold: 5
+ 
+liveness:
+ enabled: true
+ path: "/actuator/health/liveness"
+ initialDelaySeconds: 240
+ periodSeconds: 60
+ timeoutSeconds: 30
+ failureThreshold: 5
+
+ingress:
+  hosts:
+    - fps.ahub.${deploy_env_type}.${deploy_dc}.${deploy_dns_zone}
+  class: long-txn
+  tls:
+    clusterIssuer: adp-ca-issuer
+  annotations:
+    ingress.kubernetes.io/proxy-body-size: 5m
+container:
+  labels:
+    splunk.adp.com/source: ${deploy_project_name}_${deploy_env}
+    splunk.adp.com/sourcetype: ${deploy_project_name}
+    
+  env:
+    BuildVersion: ${VERSION}
+    WILY_MANAGER_URL: ${deploy_wily_manager}
+    WILY_AGENT_NAME: ${deploy_project_name}
+    WILY_PROCESS_NAME: IBPM_DOCKER-${deploy_env}
+    TZ: ${server_timezone}
+    JDK_JAVA_OPTIONS:
+      > # multi-line string. INTENDATION MATTERS! See: <https://yaml-multiline.info/>
+      -Dspring.config.name=application
+      -Dspring.profiles.active=${deploy_env_type}
+      -Dspring.config.import=configserver:http://esi-ahub-cloud-config-${deploy_env}:8080
+      -Dspring.cloud.config.label=cloud-properties-${deploy_env}
+      -Xms512m -Xmx1024m -Xss228k -XX:+UseZGC
+volumes:
+  dvts-request-share:
+    mountPath: /etc/dvts/request      
+#nodeSelector:
+#  adp.com/firewallrules: "true"   
+  
+replicaCount: 2
+resources:
+  requests:
+    cpu: 1000m
+    memory: 1024Mi
+  limits:
+    cpu: 2000m
+    memory: 2048Mi
+
+spring:
+  enabled: true
+
+podAntiAffinity:
+  enabled: true
