@@ -1,7 +1,6 @@
 package com.adp.esi.digitech.file.processing.reader.xml.service;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -21,17 +20,16 @@ import com.adp.esi.digitech.file.processing.ds.config.model.FileMetaData;
 import com.adp.esi.digitech.file.processing.ds.model.ColumnRelation;
 import com.adp.esi.digitech.file.processing.exception.ReaderException;
 import com.adp.esi.digitech.file.processing.model.DataMap;
-import com.adp.esi.digitech.file.processing.util.ValidationUtil;
 
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
 
 /**
  * Service for reading small XML files in memory and converting them to DataMap
- * objects grouped by sourceKey.
+ * objects.
  * 
- * Enhanced to support sourceKey-based grouping, primary identifier handling,
- * and payload reduction for PECI processing.
+ * Uses templates with complex structure including id, attrs arrays, child
+ * arrays, and UUID placeholders in {{uuid}} format from ColumnRelation objects.
  *
  * @author rhidau
  */
@@ -42,6 +40,8 @@ public class XMLReaderService extends AbstractXMLReaderService<DataMap, Multipar
 
 	private final List<ColumnRelation> columnRelations;
 	private final FileMetaData fileMetaData;
+	
+	
 
 	@Autowired(required = true)
 	public XMLReaderService(FileMetaData fileMetaData, List<ColumnRelation> columnRelations) {
@@ -54,6 +54,7 @@ public class XMLReaderService extends AbstractXMLReaderService<DataMap, Multipar
 		log.info("XMLReaderService -> read() Started processing xml, uniqueId = {}, sourceKey = {}",
 				requestContext.getUniqueId(), fileMetaData.getSourceKey());
 
+		// Validate inputs
 		if (file == null || file.isEmpty()) {
 			log.error("XMLReaderService -> read() Received empty or null file, uniqueId = {}, sourceKey = {}",
 					requestContext.getUniqueId(), fileMetaData.getSourceKey());
@@ -61,71 +62,74 @@ public class XMLReaderService extends AbstractXMLReaderService<DataMap, Multipar
 			readerException.setRequestContext(requestContext);
 			throw readerException;
 		}
+		
+		
 
 		validateFileMetaData(fileMetaData);
-		initializeTemplateMapping(fileMetaData, columnRelations);
+		initializeTemplateMapping(fileMetaData);
 
-		InputStream inputStreamToUse = null;
-
-		try {
-			inputStreamToUse = file.getInputStream();
-
-			if ("PECI".equalsIgnoreCase(fileMetaData.getProcessingType())
-					&& "Y".equalsIgnoreCase(fileMetaData.getFilterData())) {
-
-				var payloadReductionService = payloadReductionServiceObjectProvider.getObject(objectMapper,
-						requestContext);
-				inputStreamToUse = payloadReductionService.processXML(inputStreamToUse, fileMetaData);
-				log.info("XMLReaderService -> read() Applied payload reduction for PECI processing");
+		try (var inputStream = file.getInputStream()) {
+			if("PECI".equalsIgnoreCase(fileMetaData.getProcessingType()) && "Y".equalsIgnoreCase(fileMetaData.getFilterData())) {
+				var payloadReductionService = payloadReductionServiceObjectProvider.getObject(objectMapper, requestContext);
+				
+				var processedStream = payloadReductionService.processXML(inputStream, fileMetaData);
 			}
-
+			
+			
 			@Cleanup
-			XMLStreamReader xmlReader = createStreamReader(inputStreamToUse);
-
-			Map<String, List<DataMap>> resultMap = new HashMap<>();
-
-			for (String sourceKey : sourceKeyColumnRelationMap.keySet()) {
-				resultMap.put(sourceKey, new ArrayList<>());
-			}
+			XMLStreamReader xmlReader = createStreamReader(inputStream);
+			List<DataMap> rows = new ArrayList<>();
 
 			while (xmlReader.hasNext()) {
 				int event = xmlReader.next();
 
 				if (event == XMLStreamReader.START_ELEMENT && rootElementName.equals(xmlReader.getLocalName())) {
 
-					Map<String, Map<UUID, String>> groupedData = extractDataFromXMLGrouped(xmlReader, rootElementName);
+					// Initialize column map with all UUIDs set to null
+					Map<UUID, String> columnMap = new HashMap<>();
+					for (ColumnRelation relation : columnRelations) {
+						columnMap.put(UUID.fromString(relation.getUuid()), null);
+					}
 
-					for (Map.Entry<String, Map<UUID, String>> entry : groupedData.entrySet()) {
-						String sourceKey = entry.getKey();
-						Map<UUID, String> columnMap = entry.getValue();
-
-						boolean hasData = columnMap.values().stream().anyMatch(ValidationUtil::isHavingValue);
-
-						if (hasData) {
-							DataMap dataMap = new DataMap(columnMap);
-							resultMap.get(sourceKey).add(dataMap);
-
-							int mappedCount = (int) columnMap.entrySet().stream()
-									.mapToLong(e -> ValidationUtil.isHavingValue(e.getValue()) ? 1 : 0).sum();
-							log.debug(
-									"XMLReaderService -> read() Added DataMap to sourceKey {}: {} mapped values out of {} total columns",
-									sourceKey, mappedCount, columnMap.size());
+					// Process root element attributes first
+					String elementName = xmlReader.getLocalName();
+					for (int i = 0; i < xmlReader.getAttributeCount(); i++) {
+						String attrName = xmlReader.getAttributeLocalName(i);
+						String attrValue = xmlReader.getAttributeValue(i);
+						String attrPath = elementName + "@" + attrName;
+						String uuid = templateUuidMap.get(attrPath);
+						if (uuid != null) {
+							columnMap.put(UUID.fromString(uuid), attrValue);
+							log.debug("XMLReaderService -> read() Mapped root attribute {} = {} to UUID {}", attrPath,
+									attrValue, uuid);
 						}
 					}
+
+					// Extract data from the entire XML element tree using sophisticated template
+					// mapping
+					Map<UUID, String> extractedData = extractDataFromXML(xmlReader, elementName);
+
+					// Merge extracted data into column map
+					extractedData.forEach((key, value) -> {
+						if (value != null && !value.trim().isEmpty()) {
+							columnMap.put(key, value);
+						}
+					});
+
+					rows.add(new DataMap(columnMap));
+
+					int mappedCount = (int) columnMap.entrySet().stream().mapToLong(e -> e.getValue() != null ? 1 : 0)
+							.sum();
+					log.debug(
+							"XMLReaderService -> read() Processed DataMap for {}: {} mapped values out of {} total columns",
+							rootElementName, mappedCount, columnMap.size());
 				}
 			}
 
-			int totalRecords = resultMap.values().stream().mapToInt(List::size).sum();
 			log.info(
-					"XMLReaderService -> read() Completed processing xml, uniqueId = {}, totalRecords = {}, sourceKeys = {}",
-					requestContext.getUniqueId(), totalRecords, resultMap.keySet());
-
-			for (Map.Entry<String, List<DataMap>> entry : resultMap.entrySet()) {
-				log.info("XMLReaderService -> read() SourceKey {} has {} records", entry.getKey(),
-						entry.getValue().size());
-			}
-
-			return resultMap;
+					"XMLReaderService -> read() Completed processing xml, uniqueId = {}, sourceKey = {}, totalRecords = {}",
+					requestContext.getUniqueId(), fileMetaData.getSourceKey(), rows.size());
+			return Map.of(fileMetaData.getSourceKey(), rows);
 
 		} catch (IOException | XMLStreamException e) {
 			log.error("XMLReaderService -> read() Failed to process xml, uniqueId = {}, sourceKey = {}, message = {}",
@@ -133,17 +137,6 @@ public class XMLReaderService extends AbstractXMLReaderService<DataMap, Multipar
 			var readerException = new ReaderException("XML Parsing failed, reason = " + e.getMessage(), e.getCause());
 			readerException.setRequestContext(requestContext);
 			throw readerException;
-		} finally {
-			if (inputStreamToUse != null) {
-				try {
-					InputStream originalStream = file.getInputStream();
-					if (inputStreamToUse != originalStream) {
-						inputStreamToUse.close();
-					}
-				} catch (IOException e) {
-					log.warn("XMLReaderService -> read() Failed to close processed input stream: {}", e.getMessage());
-				}
-			}
 		}
 	}
 }
